@@ -1,4 +1,4 @@
-# XManifoldUltra: Advanced Energy Price Forecasting
+# XManifoldUltra(Fishs-transformer): Advanced Energy Price Forecasting
 
 **XManifoldUltra** 是一种高性能深度学习架构，专为电力价格波动的二分类预测（上涨或下跌）而设计。通过集成 **五专家门控系统 (MoE)** 与 **基于 Transformer 的变量间编码器**，该模型能够在保持严格“零泄露”训练环境的同时，捕捉波动时间序列数据中的复杂模式。
 
@@ -20,7 +20,6 @@
     5. **Sliding Expert**: 通过自适应池化捕捉局部特征的统计显著性。
 * **Game Room (Transformer Encoder)**: 3 层 Transformer 架构，专门模拟不同变量（如太阳能出力与电网负荷）之间复杂的非线性“博弈”关系。
 * **Zero-Leakage Pipeline**: 严苛的数据引擎，强制执行 1 步特征滞后 (Lag-1)，确保模型在预测时仅使用已知信息，彻底杜绝数据泄露。
-
 ---
 
 ## 📊 工业级异构数据集 (Dataset Description)

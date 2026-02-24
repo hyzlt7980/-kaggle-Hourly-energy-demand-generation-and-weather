@@ -7,7 +7,6 @@
 ## 🏗️ 架构概览 (Model Architecture)
 
 该模型通过多个复杂的层级处理多变量时间序列数据，以确保鲁棒的特征提取和关系建模。
-
 ![XManifoldUltra Architecture](xmanifold.png)
 
 ### 核心组件

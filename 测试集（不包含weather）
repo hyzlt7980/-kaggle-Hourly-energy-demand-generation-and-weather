@@ -1,5 +1,5 @@
-#这块是itransfomer在spain dataset的结果
 import os
+import sys
 import pandas as pd
 import numpy as np
 import torch
@@ -8,65 +8,78 @@ import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
+from torch.amp import GradScaler, autocast
 from sklearn.preprocessing import StandardScaler
+from argparse import Namespace
 
 # ==========================================
-# 1. 核心组件
+# 0. 路径强制注入 (确保 DDP 子进程 100% 找到 models)
 # ==========================================
-class RevIN(nn.Module):
-    def __init__(self, num_features, eps=1e-5, affine=True):
-        super().__init__()
-        self.eps, self.affine = eps, affine
-        if self.affine:
-            self.affine_weight = nn.Parameter(torch.ones(num_features))
-            self.affine_bias = nn.Parameter(torch.zeros(num_features))
-    def forward(self, x, mode: str):
-        if mode == 'norm':
-            self.mean = x.mean(1, keepdim=True).detach()
-            self.stdev = torch.sqrt(x.var(1, keepdim=True, unbiased=False) + self.eps).detach()
-            x = (x - self.mean) / self.stdev
-            if self.affine: x = x * self.affine_weight + self.affine_bias
-        elif mode == 'denorm':
-            if self.affine: x = (x - self.affine_bias) / self.affine_weight
-            x = x * self.stdev + self.mean
-        return x
+ABS_PATH = "/root/official_it" 
+if ABS_PATH not in sys.path:
+    sys.path.insert(0, ABS_PATH)
 
-class iTransformer_Official(nn.Module):
-    def __init__(self, n_vars, seq_len, d_model=128, n_heads=8, e_layers=3, d_ff=256, dropout=0.1):
+try:
+    from models.iTransformer import Model as iTransformer_Official
+    print(f"✅ [Rank {os.environ.get('RANK', '0')}] 成功链接官方 GitHub 源码")
+except ImportError as e:
+    print(f"❌ [Rank {os.environ.get('RANK', '0')}] 导入失败: {e}")
+    sys.exit(1)
+
+# ==========================================
+# 1. 官方模型适配器 (高维特征提取版)
+# ==========================================
+class iTransformerClassifier(nn.Module):
+    def __init__(self, configs):
         super().__init__()
-        self.revin = RevIN(n_vars)
-        self.enc_embedding = nn.Linear(seq_len, d_model)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_heads, dim_feedforward=d_ff, dropout=dropout, batch_first=True, activation='gelu')
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=e_layers)
-        self.head = nn.Sequential(nn.Flatten(), nn.Linear(n_vars * d_model, 256), nn.GELU(), nn.Linear(256, 1))
+        self.model = iTransformer_Official(configs)
+        
+        # 修正维度：9个变量 * 每个变量128维 = 1152
+        self.feature_dim = configs.enc_in * configs.d_model
+        
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(self.feature_dim, 512),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 1)
+        )
+
     def forward(self, x):
-        x = self.revin(x, 'norm')
-        B, L, N = x.shape
-        x = x.permute(0, 2, 1) # [B, N, L]
-        enc_out = self.enc_embedding(x) # [B, N, D]
-        enc_out = self.encoder(enc_out) # [B, N, D]
-        return self.head(enc_out)
+        # 绕过官方回归 Projection 层，直接提取 Encoder 后的高维特征
+        # x 形状: [Batch, Seq_Len, Vars]
+        
+        # 1. Inverted Embedding: [B, L, N] -> [B, N, D]
+        enc_out = self.model.enc_embedding(x, None) 
+        
+        # 2. Transformer Encoder: [B, N, D] -> [B, N, D]
+        enc_out, attns = self.model.encoder(enc_out, attn_mask=None)
+        
+        # 3. 分类输出: [B, N*D] -> [B, 1]
+        return self.classifier(enc_out)
 
 # ==========================================
-# 2. 数据引擎 (80/10/10)
+# 2. 数据引擎 (9变量，8:1:1 切分)
 # ==========================================
 class SpainDataset(Dataset):
     def __init__(self, csv_path, flag='train', seq_len=96, scaler=None):
         df = pd.read_csv(csv_path)
         actual_cols = ['price actual', 'total load actual', 'generation wind onshore', 
-                       'generation solar', 'generation fossil gas', 'generation nuclear', 'generation fossil hard coal']
+                       'generation solar', 'generation fossil gas', 'generation nuclear', 
+                       'generation fossil hard coal']
+        
+        # 滞后 1 位确保零泄露
         df_feat = df[actual_cols].shift(1).ffill().bfill()
-        if 'time' in df.columns:
-            t = pd.to_datetime(df['time'], utc=True)
-            hour = t.dt.hour
-        else: hour = pd.Series(np.arange(len(df)) % 24)
+        t = pd.to_datetime(df['time'], utc=True) if 'time' in df.columns else pd.Series(range(len(df)))
+        hour = t.dt.hour if hasattr(t, 'dt') else pd.Series(np.arange(len(df)) % 24)
         df_feat['h_sin'], df_feat['h_cos'] = np.sin(2*np.pi*hour/24), np.cos(2*np.pi*hour/24)
         
-        raw_price = pd.to_numeric(df['price actual'], errors='coerce').interpolate().ffill().bfill().values
-        labels = (raw_price[1:] > raw_price[:-1]).astype(float)
+        prices = pd.to_numeric(df['price actual'], errors='coerce').interpolate().values
+        labels = (prices[1:] > prices[:-1]).astype(float)
         
         n = len(df_feat) - 1
         tr, vl = int(n * 0.8), int(n * 0.9)
+        
         if flag == 'train':
             feat_raw, self.labels = df_feat.iloc[:tr].values, labels[:tr]
             self.scaler = StandardScaler().fit(feat_raw)
@@ -76,6 +89,7 @@ class SpainDataset(Dataset):
         else:
             feat_raw, self.labels = df_feat.iloc[vl-seq_len:].values, labels[vl-seq_len-1:]
             self.scaler = scaler
+            
         self.feat, self.seq_len = self.scaler.transform(feat_raw), seq_len
 
     def __len__(self): return len(self.feat) - self.seq_len
@@ -84,7 +98,7 @@ class SpainDataset(Dataset):
                torch.tensor([self.labels[i+self.seq_len-1]], dtype=torch.float32)
 
 # ==========================================
-# 3. 训练系统
+# 3. 训练主程序 (DDP + 4卡4090优化)
 # ==========================================
 def main():
     dist.init_process_group("nccl")
@@ -92,81 +106,126 @@ def main():
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
 
-    train_ds = SpainDataset('energy_dataset.csv', 'train')
-    val_ds = SpainDataset('energy_dataset.csv', 'val', scaler=train_ds.scaler)
-    test_ds = SpainDataset('energy_dataset.csv', 'test', scaler=train_ds.scaler)
+    # 全参数注入，确保官方代码运行
+    configs = Namespace(
+        task_name='short_term_forecast',
+        seq_len=96, label_len=48, pred_len=1,
+        enc_in=9, dec_in=9, c_out=9,
+        d_model=128, d_ff=256, n_heads=8, e_layers=3,
+        dropout=0.1, activation='gelu', output_attention=False,
+        use_norm=True, class_strategy='projection',
+        embed='timeF', freq='h', factor=1, distil=True,
+        moving_avg=25, p_hidden_dims=[128, 128], p_hidden_layers=2
+    )
+
+    CSV_NAME = 'energy_dataset.csv'
+    train_ds = SpainDataset(CSV_NAME, 'train')
+    val_ds = SpainDataset(CSV_NAME, 'val', scaler=train_ds.scaler)
+    test_ds = SpainDataset(CSV_NAME, 'test', scaler=train_ds.scaler)
     
     train_loader = DataLoader(train_ds, 128, sampler=DistributedSampler(train_ds))
     val_loader = DataLoader(val_ds, 128, sampler=DistributedSampler(val_ds, shuffle=False))
     test_loader = DataLoader(test_ds, 128, sampler=DistributedSampler(test_ds, shuffle=False))
 
-    model = DDP(iTransformer_Official(n_vars=9, seq_len=96).to(device), device_ids=[local_rank])
+    # 👇 这里的缩进已经修复对齐了
+    model = iTransformerClassifier(configs).to(device)
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    
     optimizer = optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-2)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20)
+    scaler = GradScaler()
     criterion = nn.BCEWithLogitsLoss()
 
-    best_val_acc, best_path = 0.0, "it_best.pth"
+    best_val_acc, best_path = 0.0, "it_official_9var_final.pth"
+    if rank == 0: print(f"🚀 iTransformer 官方核心对决版启动 | 变量Token维度: {configs.d_model}")
+
     for epoch in range(20):
         model.train(); train_loader.sampler.set_epoch(epoch)
         for bx, by in train_loader:
             bx, by = bx.to(device), by.to(device)
             optimizer.zero_grad()
-            criterion(model(bx), by * 0.9 + 0.05).backward()
-            optimizer.step()
+            with autocast('cuda'):
+                logits = model(bx)
+                loss = criterion(logits, by * 0.9 + 0.05)
+            scaler.scale(loss).backward(); scaler.step(optimizer); scaler.update()
         scheduler.step()
 
+        # 验证环节
         model.eval(); correct, total = 0, 0
         with torch.no_grad():
             for bx, by in val_loader:
                 bx, by = bx.to(device), by.to(device)
                 correct += ((model(bx) > 0).float() == by).sum().item()
                 total += by.size(0)
+        
         stats = torch.tensor([correct, total], device=device); dist.all_reduce(stats)
         if rank == 0:
             acc = stats[0].item() / stats[1].item()
-            if acc > best_val_acc: best_val_acc = acc; torch.save(model.module.state_dict(), best_path)
-            print(f"iTransformer Epoch {epoch+1} Val Acc: {acc:.2%}")
+            if acc > best_val_acc: 
+                best_val_acc = acc
+                torch.save(model.module.state_dict(), best_path)
+            print(f"Epoch {epoch+1:02d} Val Acc: {acc:.2%} | Best: {best_val_acc:.2%}")
 
     dist.barrier()
     if rank == 0:
-        model.module.load_state_dict(torch.load(best_path))
+        print(f"\n🎯 训练结束，评估最终 Test Set...")
+        model.module.load_state_dict(torch.load(best_path, map_location=device))
+        
         model.eval(); t_c, t_t = 0, 0
         with torch.no_grad():
             for bx, by in test_loader:
                 bx, by = bx.to(device), by.to(device)
-                t_c += ((model(bx) > 0).float() == by).sum().item()
-                t_t += by.size(0)
-        print(f"🌟 Final iTransformer Test Acc: {t_c/t_t:.2%}")
+                t_c += ((model(bx) > 0).float() == by).sum().item(); t_t += by.size(0)
+        
+        # 注意这里我把打印挪到了 if rank == 0 里面，并且没有再做 all_reduce，
+        # 因为在测试阶段只用单卡跑一遍测试集更稳妥（或者做 all_reduce 后确保所有 rank 都在）。
+        # 这里采用最稳的写法：只在 rank 0 上汇总。
+        # 上一版这里缩进有问题，可能导致 rank 0 跑到一半卡住。
+        
+    # 为了保证所有显卡同步退出
+    dist.barrier()
+    if rank == 0:
+        print(f"🌟 Final Official Test Acc: {t_c/t_t:.2%}")
     dist.destroy_process_group()
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    main()
 
-(base) root@ubuntu22:~# torchrun --standalone --nproc_per_node=4 --master_port=29505 train1.py
-[2026-02-25 11:49:20,314] torch.distributed.run: [WARNING] 
-[2026-02-25 11:49:20,314] torch.distributed.run: [WARNING] *****************************************
-[2026-02-25 11:49:20,314] torch.distributed.run: [WARNING] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
-[2026-02-25 11:49:20,314] torch.distributed.run: [WARNING] *****************************************
-iTransformer Epoch 1 Val Acc: 72.01%
-iTransformer Epoch 2 Val Acc: 72.52%
-iTransformer Epoch 3 Val Acc: 70.21%
-iTransformer Epoch 4 Val Acc: 71.81%
-iTransformer Epoch 5 Val Acc: 70.13%
-iTransformer Epoch 6 Val Acc: 70.55%
-iTransformer Epoch 7 Val Acc: 69.64%
-iTransformer Epoch 8 Val Acc: 70.44%
-iTransformer Epoch 9 Val Acc: 71.44%
-iTransformer Epoch 10 Val Acc: 70.92%
-iTransformer Epoch 11 Val Acc: 70.64%
-iTransformer Epoch 12 Val Acc: 69.81%
-iTransformer Epoch 13 Val Acc: 71.09%
-iTransformer Epoch 14 Val Acc: 70.81%
-iTransformer Epoch 15 Val Acc: 70.18%
-iTransformer Epoch 16 Val Acc: 69.70%
-iTransformer Epoch 17 Val Acc: 69.95%
-iTransformer Epoch 18 Val Acc: 70.01%
-iTransformer Epoch 19 Val Acc: 69.70%
-iTransformer Epoch 20 Val Acc: 69.73%
-🌟 Final iTransformer Test Acc: 67.50%
+base) root@ubuntu22:~# torchrun --standalone --nproc_per_node=4 --master_port=29580 9v-i.py 
+W0225 12:39:25.821000 10487 anaconda3/lib/python3.11/site-packages/torch/distributed/run.py:852] 
+W0225 12:39:25.821000 10487 anaconda3/lib/python3.11/site-packages/torch/distributed/run.py:852] *****************************************
+W0225 12:39:25.821000 10487 anaconda3/lib/python3.11/site-packages/torch/distributed/run.py:852] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0225 12:39:25.821000 10487 anaconda3/lib/python3.11/site-packages/torch/distributed/run.py:852] *****************************************
+✅ [Rank 0] 成功链接官方 GitHub 源码
+✅ [Rank 3] 成功链接官方 GitHub 源码
+✅ [Rank 2] 成功链接官方 GitHub 源码
+✅ [Rank 1] 成功链接官方 GitHub 源码
+🚀 iTransformer 官方核心对决版启动 | 变量Token维度: 128
+Epoch 01 Val Acc: 70.44% | Best: 70.44%
+Epoch 02 Val Acc: 70.70% | Best: 70.70%
+Epoch 03 Val Acc: 71.92% | Best: 71.92%
+Epoch 04 Val Acc: 72.15% | Best: 72.15%
+Epoch 05 Val Acc: 71.69% | Best: 72.15%
+Epoch 06 Val Acc: 72.41% | Best: 72.41%
+Epoch 07 Val Acc: 70.47% | Best: 72.41%
+Epoch 08 Val Acc: 72.35% | Best: 72.41%
+Epoch 09 Val Acc: 71.78% | Best: 72.41%
+Epoch 10 Val Acc: 72.06% | Best: 72.41%
+Epoch 11 Val Acc: 72.66% | Best: 72.66%
+Epoch 12 Val Acc: 70.90% | Best: 72.66%
+Epoch 13 Val Acc: 70.87% | Best: 72.66%
+Epoch 14 Val Acc: 72.75% | Best: 72.75%
+Epoch 15 Val Acc: 71.38% | Best: 72.75%
+Epoch 16 Val Acc: 71.27% | Best: 72.75%
+Epoch 17 Val Acc: 72.01% | Best: 72.75%
+Epoch 18 Val Acc: 71.84% | Best: 72.75%
+Epoch 19 Val Acc: 71.18% | Best: 72.75%
+Epoch 20 Val Acc: 71.27% | Best: 72.75%
+/root/anaconda3/lib/python3.11/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+
+🎯 训练结束，评估最终 Test Set...
+🌟 Final Official Test Acc: 71.84%
 
 
 

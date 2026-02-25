@@ -1,0 +1,487 @@
+#这块是itransfomer在spain dataset的结果
+import os
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
+from sklearn.preprocessing import StandardScaler
+
+# ==========================================
+# 1. 核心组件
+# ==========================================
+class RevIN(nn.Module):
+    def __init__(self, num_features, eps=1e-5, affine=True):
+        super().__init__()
+        self.eps, self.affine = eps, affine
+        if self.affine:
+            self.affine_weight = nn.Parameter(torch.ones(num_features))
+            self.affine_bias = nn.Parameter(torch.zeros(num_features))
+    def forward(self, x, mode: str):
+        if mode == 'norm':
+            self.mean = x.mean(1, keepdim=True).detach()
+            self.stdev = torch.sqrt(x.var(1, keepdim=True, unbiased=False) + self.eps).detach()
+            x = (x - self.mean) / self.stdev
+            if self.affine: x = x * self.affine_weight + self.affine_bias
+        elif mode == 'denorm':
+            if self.affine: x = (x - self.affine_bias) / self.affine_weight
+            x = x * self.stdev + self.mean
+        return x
+
+class iTransformer_Official(nn.Module):
+    def __init__(self, n_vars, seq_len, d_model=128, n_heads=8, e_layers=3, d_ff=256, dropout=0.1):
+        super().__init__()
+        self.revin = RevIN(n_vars)
+        self.enc_embedding = nn.Linear(seq_len, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_heads, dim_feedforward=d_ff, dropout=dropout, batch_first=True, activation='gelu')
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=e_layers)
+        self.head = nn.Sequential(nn.Flatten(), nn.Linear(n_vars * d_model, 256), nn.GELU(), nn.Linear(256, 1))
+    def forward(self, x):
+        x = self.revin(x, 'norm')
+        B, L, N = x.shape
+        x = x.permute(0, 2, 1) # [B, N, L]
+        enc_out = self.enc_embedding(x) # [B, N, D]
+        enc_out = self.encoder(enc_out) # [B, N, D]
+        return self.head(enc_out)
+
+# ==========================================
+# 2. 数据引擎 (80/10/10)
+# ==========================================
+class SpainDataset(Dataset):
+    def __init__(self, csv_path, flag='train', seq_len=96, scaler=None):
+        df = pd.read_csv(csv_path)
+        actual_cols = ['price actual', 'total load actual', 'generation wind onshore', 
+                       'generation solar', 'generation fossil gas', 'generation nuclear', 'generation fossil hard coal']
+        df_feat = df[actual_cols].shift(1).ffill().bfill()
+        if 'time' in df.columns:
+            t = pd.to_datetime(df['time'], utc=True)
+            hour = t.dt.hour
+        else: hour = pd.Series(np.arange(len(df)) % 24)
+        df_feat['h_sin'], df_feat['h_cos'] = np.sin(2*np.pi*hour/24), np.cos(2*np.pi*hour/24)
+        
+        raw_price = pd.to_numeric(df['price actual'], errors='coerce').interpolate().ffill().bfill().values
+        labels = (raw_price[1:] > raw_price[:-1]).astype(float)
+        
+        n = len(df_feat) - 1
+        tr, vl = int(n * 0.8), int(n * 0.9)
+        if flag == 'train':
+            feat_raw, self.labels = df_feat.iloc[:tr].values, labels[:tr]
+            self.scaler = StandardScaler().fit(feat_raw)
+        elif flag == 'val':
+            feat_raw, self.labels = df_feat.iloc[tr-seq_len:vl].values, labels[tr-seq_len-1:vl-1]
+            self.scaler = scaler
+        else:
+            feat_raw, self.labels = df_feat.iloc[vl-seq_len:].values, labels[vl-seq_len-1:]
+            self.scaler = scaler
+        self.feat, self.seq_len = self.scaler.transform(feat_raw), seq_len
+
+    def __len__(self): return len(self.feat) - self.seq_len
+    def __getitem__(self, i): 
+        return torch.tensor(self.feat[i:i+self.seq_len], dtype=torch.float32), \
+               torch.tensor([self.labels[i+self.seq_len-1]], dtype=torch.float32)
+
+# ==========================================
+# 3. 训练系统
+# ==========================================
+def main():
+    dist.init_process_group("nccl")
+    rank, local_rank = int(os.environ["RANK"]), int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+
+    train_ds = SpainDataset('energy_dataset.csv', 'train')
+    val_ds = SpainDataset('energy_dataset.csv', 'val', scaler=train_ds.scaler)
+    test_ds = SpainDataset('energy_dataset.csv', 'test', scaler=train_ds.scaler)
+    
+    train_loader = DataLoader(train_ds, 128, sampler=DistributedSampler(train_ds))
+    val_loader = DataLoader(val_ds, 128, sampler=DistributedSampler(val_ds, shuffle=False))
+    test_loader = DataLoader(test_ds, 128, sampler=DistributedSampler(test_ds, shuffle=False))
+
+    model = DDP(iTransformer_Official(n_vars=9, seq_len=96).to(device), device_ids=[local_rank])
+    optimizer = optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-2)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20)
+    criterion = nn.BCEWithLogitsLoss()
+
+    best_val_acc, best_path = 0.0, "it_best.pth"
+    for epoch in range(20):
+        model.train(); train_loader.sampler.set_epoch(epoch)
+        for bx, by in train_loader:
+            bx, by = bx.to(device), by.to(device)
+            optimizer.zero_grad()
+            criterion(model(bx), by * 0.9 + 0.05).backward()
+            optimizer.step()
+        scheduler.step()
+
+        model.eval(); correct, total = 0, 0
+        with torch.no_grad():
+            for bx, by in val_loader:
+                bx, by = bx.to(device), by.to(device)
+                correct += ((model(bx) > 0).float() == by).sum().item()
+                total += by.size(0)
+        stats = torch.tensor([correct, total], device=device); dist.all_reduce(stats)
+        if rank == 0:
+            acc = stats[0].item() / stats[1].item()
+            if acc > best_val_acc: best_val_acc = acc; torch.save(model.module.state_dict(), best_path)
+            print(f"iTransformer Epoch {epoch+1} Val Acc: {acc:.2%}")
+
+    dist.barrier()
+    if rank == 0:
+        model.module.load_state_dict(torch.load(best_path))
+        model.eval(); t_c, t_t = 0, 0
+        with torch.no_grad():
+            for bx, by in test_loader:
+                bx, by = bx.to(device), by.to(device)
+                t_c += ((model(bx) > 0).float() == by).sum().item()
+                t_t += by.size(0)
+        print(f"🌟 Final iTransformer Test Acc: {t_c/t_t:.2%}")
+    dist.destroy_process_group()
+
+if __name__ == "__main__": main()
+
+(base) root@ubuntu22:~# torchrun --standalone --nproc_per_node=4 --master_port=29505 train1.py
+[2026-02-25 11:49:20,314] torch.distributed.run: [WARNING] 
+[2026-02-25 11:49:20,314] torch.distributed.run: [WARNING] *****************************************
+[2026-02-25 11:49:20,314] torch.distributed.run: [WARNING] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+[2026-02-25 11:49:20,314] torch.distributed.run: [WARNING] *****************************************
+iTransformer Epoch 1 Val Acc: 72.01%
+iTransformer Epoch 2 Val Acc: 72.52%
+iTransformer Epoch 3 Val Acc: 70.21%
+iTransformer Epoch 4 Val Acc: 71.81%
+iTransformer Epoch 5 Val Acc: 70.13%
+iTransformer Epoch 6 Val Acc: 70.55%
+iTransformer Epoch 7 Val Acc: 69.64%
+iTransformer Epoch 8 Val Acc: 70.44%
+iTransformer Epoch 9 Val Acc: 71.44%
+iTransformer Epoch 10 Val Acc: 70.92%
+iTransformer Epoch 11 Val Acc: 70.64%
+iTransformer Epoch 12 Val Acc: 69.81%
+iTransformer Epoch 13 Val Acc: 71.09%
+iTransformer Epoch 14 Val Acc: 70.81%
+iTransformer Epoch 15 Val Acc: 70.18%
+iTransformer Epoch 16 Val Acc: 69.70%
+iTransformer Epoch 17 Val Acc: 69.95%
+iTransformer Epoch 18 Val Acc: 70.01%
+iTransformer Epoch 19 Val Acc: 69.70%
+iTransformer Epoch 20 Val Acc: 69.73%
+🌟 Final iTransformer Test Acc: 67.50%
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#这块是xmanifold在spain dataset的结果
+import os
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
+from torch.cuda.amp import GradScaler, autocast
+from sklearn.preprocessing import StandardScaler
+
+# ==========================================
+# 0. 基础组件
+# ==========================================
+class Transpose(nn.Module):
+    def __init__(self, dim0, dim1):
+        super().__init__()
+        self.dim0, self.dim1 = dim0, dim1
+    def forward(self, x): return x.transpose(self.dim0, self.dim1)
+
+class RevIN(nn.Module):
+    def __init__(self, num_features, eps=1e-5, affine=True):
+        super().__init__()
+        self.eps, self.affine = eps, affine
+        if self.affine:
+            self.affine_weight = nn.Parameter(torch.ones(num_features))
+            self.affine_bias = nn.Parameter(torch.zeros(num_features))
+    def forward(self, x, mode: str):
+        if mode == 'norm':
+            self.mean = x.mean(1, keepdim=True).detach()
+            self.stdev = torch.sqrt(x.var(1, keepdim=True, unbiased=False) + self.eps).detach()
+            x = (x - self.mean) / self.stdev
+            if self.affine: x = x * self.affine_weight + self.affine_bias
+        elif mode == 'denorm':
+            if self.affine: x = (x - self.affine_bias) / self.affine_weight
+            x = x * self.stdev + self.mean
+        return x
+
+# ==========================================
+# 1. Swin 1D 核心逻辑
+# ==========================================
+class SwinWindowAttention1D(nn.Module):
+    def __init__(self, dim, window_size, shift_size, num_heads=4):
+        super().__init__()
+        self.dim, self.window_size, self.shift_size, self.num_heads = dim, window_size, shift_size, num_heads
+        self.scale = (dim // num_heads) ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj = nn.Linear(dim, dim)
+        self.rel_pos_bias_table = nn.Parameter(torch.zeros((2 * window_size - 1), num_heads))
+        nn.init.trunc_normal_(self.rel_pos_bias_table, std=.02)
+
+    def forward(self, x, mask=None):
+        B_N, num_win, ws, D = x.shape
+        qkv = self.qkv(x).reshape(B_N, num_win, ws, 3, self.num_heads, D // self.num_heads).permute(3, 0, 1, 4, 2, 5)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        coords = torch.arange(ws); rel_index = (coords[None, :] - coords[:, None] + ws - 1).to(x.device)
+        rel_pos_bias = self.rel_pos_bias_table[rel_index.view(-1)].view(ws, ws, -1).permute(2, 0, 1).unsqueeze(0).unsqueeze(0)
+        attn = attn + rel_pos_bias
+        if mask is not None: attn = attn + mask.unsqueeze(1).unsqueeze(0)
+        attn = F.softmax(attn, dim=-1)
+        return self.proj((attn @ v).transpose(2, 3).reshape(B_N, num_win, ws, D))
+
+class SwinBlock1D(nn.Module):
+    def __init__(self, dim, seq_len, window_size=8, shift_size=4):
+        super().__init__()
+        self.dim, self.window_size, self.shift_size = dim, window_size, shift_size
+        self.norm1 = nn.LayerNorm(dim); self.attn = SwinWindowAttention1D(dim, window_size, 0)
+        self.norm2 = nn.LayerNorm(dim); self.shift_attn = SwinWindowAttention1D(dim, window_size, shift_size)
+        if self.shift_size > 0:
+            img_mask = torch.zeros((1, seq_len, 1)); s_slices = (slice(0, -window_size), slice(-window_size, -shift_size), slice(-shift_size, None))
+            for i, s in enumerate(s_slices): img_mask[:, s, :] = i
+            m_win = img_mask.view(1, seq_len // window_size, window_size, 1).reshape(-1, window_size)
+            attn_mask = m_win.unsqueeze(1) - m_win.unsqueeze(2)
+            self.register_buffer("attn_mask", attn_mask.masked_fill(attn_mask != 0, -100.0).masked_fill(attn_mask == 0, 0.0))
+        else: self.attn_mask = None
+
+    def forward(self, x):
+        B_N, L, D = x.shape
+        h = x; x = self.norm1(x).view(B_N, L // self.window_size, self.window_size, D)
+        x = self.attn(x).view(B_N, L, D) + h
+        h = x; x = self.norm2(x)
+        if self.shift_size > 0: x = torch.roll(x, shifts=-self.shift_size, dims=1)
+        x = x.view(B_N, L // self.window_size, self.window_size, D)
+        x = self.shift_attn(x, mask=self.attn_mask).view(B_N, L, D)
+        if self.shift_size > 0: x = torch.roll(x, shifts=self.shift_size, dims=1)
+        return x + h
+
+# ==========================================
+# 2. 五专家门控系统
+# ==========================================
+class IntraColumnPentaExperts(nn.Module):
+    def __init__(self, seq_len=96, d_model=256, path_drop=0.35):
+        super().__init__()
+        self.path_drop = path_drop
+        self.exp_global = nn.Linear(seq_len, d_model)
+        self.exp_local = nn.Sequential(nn.Conv1d(1, 64, 3, padding=1), nn.GELU(), nn.Conv1d(64, 1, 3, padding=1), nn.Flatten(), nn.Linear(seq_len, d_model), nn.Dropout(0.5))
+        self.exp_diff = nn.Sequential(nn.Linear(seq_len - 1, d_model), nn.LayerNorm(d_model), nn.Dropout(0.45))
+        self.exp_swin = nn.Sequential(nn.Linear(1, d_model), SwinBlock1D(d_model, seq_len), Transpose(1, 2), nn.AdaptiveAvgPool1d(1), nn.Flatten(), nn.Dropout(0.45))
+        self.exp_sliding = nn.Sequential(nn.Conv1d(1, d_model, kernel_size=3, stride=1, padding=1), nn.BatchNorm1d(d_model), nn.GELU(), nn.AdaptiveAvgPool1d(1), nn.Flatten(), nn.Dropout(0.45))
+        self.gate = nn.Sequential(nn.Linear(d_model * 5, 128), nn.GELU(), nn.Linear(128, 5))
+        self.temp = 2.0 
+
+    def forward(self, x_strip):
+        f1 = self.exp_global(x_strip)
+        f2 = self.exp_local(x_strip.unsqueeze(1))
+        f3 = self.exp_diff(x_strip[:, 1:] - x_strip[:, :-1])
+        f4 = self.exp_swin(x_strip.unsqueeze(-1))
+        f5 = self.exp_sliding(x_strip.unsqueeze(1))
+        experts = [f1, f2, f3, f4, f5]
+        if self.training:
+            for i in range(len(experts)):
+                if torch.rand(1) < self.path_drop: experts[i] = torch.zeros_like(experts[i])
+        logits = self.gate(torch.cat([f1, f2, f3, f4, f5], dim=-1))
+        w = F.softmax(logits / self.temp, dim=-1)
+        return sum(w[:, i:i+1] * experts[i] for i in range(5))
+
+# ==========================================
+# 3. XManifoldUltra 核心架构
+# ==========================================
+class XManifoldUltra(nn.Module):
+    def __init__(self, seq_len=96, num_vars=14, d_model=256, noise_std=0.01):
+        super().__init__()
+        self.noise_std, self.revin = noise_std, RevIN(num_vars)
+        self.experts = IntraColumnPentaExperts(seq_len, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(d_model, 8, d_model*4, 0.2, batch_first=True, norm_first=True)
+        self.game_room = nn.TransformerEncoder(encoder_layer, 3)
+        self.head = nn.Sequential(nn.Linear(num_vars * d_model, 512), nn.GELU(), nn.Dropout(0.45), nn.Linear(512, 1))
+
+    def forward(self, x):
+        x = self.revin(x, 'norm')
+        B, L, N = x.shape
+        tokens = self.experts(x.permute(0, 2, 1).reshape(B * N, L)).view(B, N, -1)
+        if self.training: tokens = tokens + torch.randn_like(tokens) * self.noise_std
+        return self.head(self.game_room(tokens).reshape(B, -1))
+
+# ==========================================
+# 4. 数据加载 (对齐 iTransformer)
+# ==========================================
+class SpainDataset(Dataset):
+    def __init__(self, energy_path, weather_path, flag='train', seq_len=96, scaler=None):
+        df_e, df_w = pd.read_csv(energy_path), pd.read_csv(weather_path)
+        df_e['time'] = pd.to_datetime(df_e['time'], utc=True)
+        df_w['time'] = pd.to_datetime(df_w['dt_iso'], utc=True)
+        w_cols = ['temp', 'pressure', 'humidity', 'wind_speed', 'clouds_all']
+        df_w[w_cols] = df_w[w_cols].apply(pd.to_numeric, errors='coerce')
+        w_avg = df_w.groupby('time')[w_cols].mean().reset_index()
+        full_df = pd.merge(df_e, w_avg, on='time', how='left')
+        
+        actual_cols = ['price actual', 'total load actual', 'generation wind onshore', 'generation solar', 
+                       'generation fossil gas', 'generation nuclear', 'generation fossil hard coal'] + w_cols
+        df_feat = full_df[actual_cols].shift(1).ffill().bfill()
+        hour = full_df['time'].dt.hour
+        df_feat['h_sin'], df_feat['h_cos'] = np.sin(2*np.pi*hour/24), np.cos(2*np.pi*hour/24)
+        
+        prices = pd.to_numeric(full_df['price actual'], errors='coerce').interpolate().values
+        labels = (prices[1:] > prices[:-1]).astype(float)
+        
+        n = len(df_feat) - 1
+        tr, vl = int(n * 0.8), int(n * 0.9)
+        if flag == 'train':
+            feat_raw, self.labels = df_feat.iloc[:tr].values, labels[:tr]
+            self.scaler = StandardScaler().fit(feat_raw)
+        elif flag == 'val':
+            feat_raw, self.labels = df_feat.iloc[tr-seq_len:vl].values, labels[tr-seq_len-1:vl-1]
+            self.scaler = scaler
+        else:
+            feat_raw, self.labels = df_feat.iloc[vl-seq_len:].values, labels[vl-seq_len-1:]
+            self.scaler = scaler
+        self.feat, self.seq_len = self.scaler.transform(feat_raw), seq_len
+
+    def __len__(self): return len(self.feat) - self.seq_len
+    def __getitem__(self, i): return torch.tensor(self.feat[i:i+self.seq_len], dtype=torch.float32), torch.tensor([self.labels[i+self.seq_len-1]], dtype=torch.float32)
+
+# ==========================================
+# 5. DDP 训练系统
+# ==========================================
+def main():
+    dist.init_process_group("nccl")
+    rank, local_rank = int(os.environ["RANK"]), int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+
+    train_ds = SpainDataset('energy_dataset.csv', 'weather_features.csv', 'train')
+    val_ds = SpainDataset('energy_dataset.csv', 'weather_features.csv', 'val', scaler=train_ds.scaler)
+    test_ds = SpainDataset('energy_dataset.csv', 'weather_features.csv', 'test', scaler=train_ds.scaler)
+    
+    train_loader = DataLoader(train_ds, 128, sampler=DistributedSampler(train_ds))
+    val_loader = DataLoader(val_ds, 128, sampler=DistributedSampler(val_ds, shuffle=False))
+    test_loader = DataLoader(test_ds, 128, sampler=DistributedSampler(test_ds, shuffle=False))
+
+    model = DDP(XManifoldUltra(num_vars=14).to(device), device_ids=[local_rank])
+    optimizer = optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-2)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20)
+    scaler = GradScaler()
+    criterion = nn.BCEWithLogitsLoss()
+
+    best_val_acc, best_path = 0.0, "x_best.pth"
+    if rank == 0: print("🚀 XManifoldUltra 对决版启动...")
+
+    for epoch in range(20):
+        model.train(); train_loader.sampler.set_epoch(epoch)
+        for bx, by in train_loader:
+            bx, by = bx.to(device), by.to(device)
+            optimizer.zero_grad()
+            with autocast(): # 👈 修复此处参数报错
+                logits = model(bx)
+                loss = criterion(logits, by * 0.9 + 0.05)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer); scaler.update()
+        scheduler.step()
+
+        model.eval(); correct, total = 0, 0
+        with torch.no_grad():
+            for bx, by in val_loader:
+                bx, by = bx.to(device), by.to(device)
+                correct += ((model(bx) > 0).float() == by).sum().item()
+                total += by.size(0)
+        stats = torch.tensor([correct, total], device=device)
+        dist.all_reduce(stats)
+        if rank == 0:
+            acc = stats[0].item() / stats[1].item()
+            if acc > best_val_acc: best_val_acc = acc; torch.save(model.module.state_dict(), best_path)
+            print(f"Epoch {epoch+1} Val Acc: {acc:.2%}")
+
+    dist.barrier()
+    if rank == 0:
+        model.module.load_state_dict(torch.load(best_path))
+        model.eval(); t_c, t_t = 0, 0
+        with torch.no_grad():
+            for bx, by in test_loader:
+                bx, by = bx.to(device), by.to(device)
+                t_c += ((model(bx) > 0).float() == by).sum().item()
+                t_t += by.size(0)
+        print(f"🌟 XManifold Final Test Acc: {t_c/t_t:.2%}")
+    dist.destroy_process_group()
+
+if __name__ == "__main__": main()
+
+
+(base) root@ubuntu22:~# torchrun --standalone --nproc_per_node=4 --master_port=29505 train1.py
+[2026-02-25 11:46:58,761] torch.distributed.run: [WARNING] 
+[2026-02-25 11:46:58,761] torch.distributed.run: [WARNING] *****************************************
+[2026-02-25 11:46:58,761] torch.distributed.run: [WARNING] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+[2026-02-25 11:46:58,761] torch.distributed.run: [WARNING] *****************************************
+/root/anaconda3/lib/python3.11/site-packages/torch/nn/modules/transformer.py:286: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(f"enable_nested_tensor is True, but self.use_nested_tensor is False because {why_not_sparsity_fast_path}")
+/root/anaconda3/lib/python3.11/site-packages/torch/nn/modules/transformer.py:286: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(f"enable_nested_tensor is True, but self.use_nested_tensor is False because {why_not_sparsity_fast_path}")
+/root/anaconda3/lib/python3.11/site-packages/torch/nn/modules/transformer.py:286: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(f"enable_nested_tensor is True, but self.use_nested_tensor is False because {why_not_sparsity_fast_path}")
+/root/anaconda3/lib/python3.11/site-packages/torch/nn/modules/transformer.py:286: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(f"enable_nested_tensor is True, but self.use_nested_tensor is False because {why_not_sparsity_fast_path}")
+🚀 XManifoldUltra 满血五专家版启动...
+/root/train1.py:193: UserWarning: Specified kernel cache directory could not be created! This disables kernel caching. Specified directory is /root/.cache/torch/kernels. This warning will appear only once per process. (Triggered internally at /opt/conda/conda-bld/pytorch_1711403378171/work/aten/src/ATen/native/cuda/jit_utils.cpp:1442.)
+  return self.fc(torch.abs(x_fft))
+/root/train1.py:193: UserWarning: Specified kernel cache directory could not be created! This disables kernel caching. Specified directory is /root/.cache/torch/kernels. This warning will appear only once per process. (Triggered internally at /opt/conda/conda-bld/pytorch_1711403378171/work/aten/src/ATen/native/cuda/jit_utils.cpp:1442.)
+  return self.fc(torch.abs(x_fft))
+/root/train1.py:193: UserWarning: Specified kernel cache directory could not be created! This disables kernel caching. Specified directory is /root/.cache/torch/kernels. This warning will appear only once per process. (Triggered internally at /opt/conda/conda-bld/pytorch_1711403378171/work/aten/src/ATen/native/cuda/jit_utils.cpp:1442.)
+  return self.fc(torch.abs(x_fft))
+[rank3]:[W reducer.cpp:1360] Warning: find_unused_parameters=True was specified in DDP constructor, but did not find any unused parameters in the forward pass. This flag results in an extra traversal of the autograd graph every iteration,  which can adversely affect performance. If your model indeed never has any unused parameters in the forward pass, consider turning this flag off. Note that this warning may be a false positive if your model has flow control causing later iterations to have unused parameters. (function operator())
+[rank0]:[W reducer.cpp:1360] Warning: find_unused_parameters=True was specified in DDP constructor, but did not find any unused parameters in the forward pass. This flag results in an extra traversal of the autograd graph every iteration,  which can adversely affect performance. If your model indeed never has any unused parameters in the forward pass, consider turning this flag off. Note that this warning may be a false positive if your model has flow control causing later iterations to have unused parameters. (function operator())
+[rank2]:[W reducer.cpp:1360] Warning: find_unused_parameters=True was specified in DDP constructor, but did not find any unused parameters in the forward pass. This flag results in an extra traversal of the autograd graph every iteration,  which can adversely affect performance. If your model indeed never has any unused parameters in the forward pass, consider turning this flag off. Note that this warning may be a false positive if your model has flow control causing later iterations to have unused parameters. (function operator())
+[rank1]:[W reducer.cpp:1360] Warning: find_unused_parameters=True was specified in DDP constructor, but did not find any unused parameters in the forward pass. This flag results in an extra traversal of the autograd graph every iteration,  which can adversely affect performance. If your model indeed never has any unused parameters in the forward pass, consider turning this flag off. Note that this warning may be a false positive if your model has flow control causing later iterations to have unused parameters. (function operator())
+XManifold Ultra Epoch 01 Val Acc: 67.65% | Best: 67.65%
+XManifold Ultra Epoch 02 Val Acc: 70.07% | Best: 70.07%
+XManifold Ultra Epoch 03 Val Acc: 72.43% | Best: 72.43%
+XManifold Ultra Epoch 04 Val Acc: 71.78% | Best: 72.43%
+XManifold Ultra Epoch 05 Val Acc: 71.89% | Best: 72.43%
+XManifold Ultra Epoch 06 Val Acc: 71.55% | Best: 72.43%
+XManifold Ultra Epoch 07 Val Acc: 70.04% | Best: 72.43%
+XManifold Ultra Epoch 08 Val Acc: 70.50% | Best: 72.43%
+XManifold Ultra Epoch 09 Val Acc: 70.81% | Best: 72.43%
+XManifold Ultra Epoch 10 Val Acc: 71.78% | Best: 72.43%
+XManifold Ultra Epoch 11 Val Acc: 71.92% | Best: 72.43%
+XManifold Ultra Epoch 12 Val Acc: 71.15% | Best: 72.43%
+XManifold Ultra Epoch 13 Val Acc: 71.41% | Best: 72.43%
+XManifold Ultra Epoch 14 Val Acc: 71.98% | Best: 72.43%
+XManifold Ultra Epoch 15 Val Acc: 71.01% | Best: 72.43%
+XManifold Ultra Epoch 16 Val Acc: 71.32% | Best: 72.43%
+XManifold Ultra Epoch 17 Val Acc: 71.12% | Best: 72.43%
+XManifold Ultra Epoch 18 Val Acc: 71.09% | Best: 72.43%
+XManifold Ultra Epoch 19 Val Acc: 70.98% | Best: 72.43%
+XManifold Ultra Epoch 20 Val Acc: 71.12% | Best: 72.43%
+
+🎯 训练圆满结束，开始测试集评估...
+🌟 Final XManifold Ultra Test Acc: 74.29%

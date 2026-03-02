@@ -56,7 +56,7 @@
 
 **代表性论文：**
 * *MDPI - Energies (2026)*: [Predictive Models for Renewable Energy Generation and Demand in Smart Cities: A Spatio-Temporal Framework](https://www.mdpi.com/1996-1073/19/1/87)
-* *MDPI - Energies (2024)*: [Investigation of Load, Solar and Wind Generation as Target Variables in LSTM Time Series Forecasting, Using Exogenous Weather Variables](https://www.mdpi.com/1996-1073/17/8/1827#B13-energies-17-01827)
+* *MDPI - Energies (2024)*: [Investigation of Load, Solar and Wind Generation as Target Variables in LSTM Time Series Forecasting, Using Exogenous Weather Variables](https://www.mdpi.com/1996-1073/17/8/1827)
 
 ---
 

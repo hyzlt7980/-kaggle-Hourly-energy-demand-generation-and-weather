@@ -725,7 +725,7 @@ mse:0.210279181599617, mae:0.32340919971466064, rse:0.5663564205169678
 
 
 
-TimeMixer++:
+TimeMixer:
 cd ~
 git clone https://github.com/kwuking/TimeMixer.git
 cd TimeMixer
@@ -736,8 +736,6 @@ cp ~/PatchTST/PatchTST_supervised/dataset/spain_energy.csv ./dataset/
 
 # 3. 安装依赖项
 pip install -r requirements.txt
-
-
 
 
 (base) root@ubuntu22:~/TimeMixer# ^C
